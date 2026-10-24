@@ -1,0 +1,3 @@
+# Private app: keep it out of search engines if it is ever exposed publicly.
+User-agent: *
+Disallow: /

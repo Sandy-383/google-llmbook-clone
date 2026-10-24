@@ -1,0 +1,145 @@
+name: llmbook
+
+# Ollama is NOT in this file: it runs natively on the host so it gets direct GPU access.
+# Containers reach it through host.docker.internal.
+
+x-api-env: &api-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-llmbook}:${POSTGRES_PASSWORD:-llmbook}@postgres:5432/${POSTGRES_DB:-llmbook}
+  REDIS_URL: redis://redis:6379/0
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  CHAT_MODEL: ${CHAT_MODEL:-qwen3:8b}
+  EMBED_MODEL: ${EMBED_MODEL:-bge-m3}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+  STORAGE_DIR: /data/files
+  OCR_LANGUAGES: ${OCR_LANGUAGES:-eng}
+  # ALLOWED_ORIGINS defaults to the localhost addresses; set it in .env to add a public address.
+  # Trusts X-Forwarded-For from Caddy. The API port below is also published on 127.0.0.1 for
+  # local debugging; remove that mapping in production so only Caddy can reach the API.
+  FORWARDED_ALLOW_IPS: "*"
+
+x-api-image: &api-image
+  build:
+    context: ./apps/api
+    args:
+      EXTRA_OCR_LANGS: ${EXTRA_OCR_LANGS:-}
+  image: llmbook-api:dev
+  # Any app setting (see apps/api/app/core/config.py) can be set in .env; the values under
+  # `environment` take precedence because they wire the containers together.
+  env_file:
+    - path: .env
+      required: false
+  environment: *api-env
+  # Uploaded files, shared by the API (writes) and the worker (reads).
+  volumes:
+    - filedata:/data/files
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-llmbook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-llmbook}
+      POSTGRES_DB: ${POSTGRES_DB:-llmbook}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *api-image
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *api-image
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    <<: *api-image
+    # -B runs the beat scheduler in-process; fine for a single worker. Split it out when scaling workers.
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "-B", "-Q", "default,ingest", "--loglevel", "INFO", "--concurrency", "2", "--schedule", "/tmp/celerybeat-schedule"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  llm-worker:
+    <<: *api-image
+    # Source guides and studio outputs use the chat model on the shared GPU: one at a time, and
+    # on their own queue so long generations never hold up document processing.
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "llm", "--loglevel", "INFO", "--concurrency", "1"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  web:
+    build: ./apps/web
+    image: llmbook-web:dev
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2.10-alpine
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # The built Android app and its assetlinks.json (see android/README.md).
+      - ./android/public:/srv/android:ro
+      - caddydata:/data
+    depends_on:
+      - api
+      - web
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  caddydata:
+  filedata:

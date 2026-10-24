@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Generated: pdf.js assets copied from node_modules (apps/web/scripts/copy-pdfjs-assets.mjs)
+apps/web/public/pdfjs/
+
+# Environment & local data
+.env
+.env.*
+!.env.example
+data/
+
+# OS
+.DS_Store
+Thumbs.db

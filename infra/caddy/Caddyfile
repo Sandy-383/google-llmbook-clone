@@ -1,0 +1,63 @@
+{
+	servers {
+		# Requests reach Caddy from private addresses only: Docker's port mapping, which is also
+		# where a Cloudflare tunnel or Tailscale Funnel connects (scripts/share.ps1). They pass
+		# the visitor's real address (Cloudflare in Cf-Connecting-Ip, which its edge always
+		# overwrites; Tailscale in X-Forwarded-For), so rate limits and logs see real visitors.
+		trusted_proxies static private_ranges
+		client_ip_headers Cf-Connecting-Ip X-Forwarded-For
+		# Read X-Forwarded-For right to left, skipping trusted hops, so a visitor can't put a
+		# fake address at the front of the header.
+		trusted_proxies_strict
+	}
+}
+
+# Single entry point: the browser sees one origin, so session cookies and CORS stay simple.
+# For a real domain, replace ":8080" with the hostname and Caddy provisions HTTPS automatically.
+:8080 {
+	# Access log (JSON, to `docker compose logs proxy`), including requests that never reach the
+	# API: interrupted uploads, oversized bodies. Caddy redacts cookie and auth headers.
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	# The Android app (android/, built with Bubblewrap). assetlinks.json proves the app and this
+	# site belong together, so Android opens the site in the app without a browser bar.
+	handle /.well-known/assetlinks.json {
+		root * /srv/android
+		header Content-Type application/json
+		file_server
+	}
+	handle /download/* {
+		root * /srv/android
+		@apk path *.apk
+		header @apk Content-Type application/vnd.android.package-archive
+		header @apk Cache-Control "no-cache"
+		file_server
+	}
+
+	handle /api/* {
+		request_body {
+			max_size 60MB
+		}
+		reverse_proxy api:8000 {
+			# One trusted address for the API (uvicorn --proxy-headers reads it).
+			header_up X-Forwarded-For {client_ip}
+			# Flush immediately so streamed answers (SSE) reach the browser token by token.
+			flush_interval -1
+		}
+	}
+
+	handle {
+		encode zstd gzip
+		reverse_proxy web:3000
+	}
+}
